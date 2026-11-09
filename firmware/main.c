@@ -289,9 +289,24 @@ static void scenario_mask_stress(void) {
      * have ended disabled). Reading everything up front, then acting
      * on it in a second pass with no further polling until the final
      * probe, removes the race entirely. */
-    char steps[64];
+    /* Sized to the wire protocol's actual limit (fabric/protocol.py's
+     * encode_mask_stress permits up to 255 steps -- a uint8_t length
+     * byte's full range), not an arbitrary smaller number. An earlier
+     * version used a 64-byte buffer and silently truncated anything
+     * longer: the host would still write its full (e.g. 200-byte)
+     * sequence onto the wire, but the firmware only read back the
+     * first 64 of those bytes here, leaving the rest sitting unread in
+     * the pipe. Those leftover command bytes then got misread as
+     * stimulus by whatever ran next on the same boot -- not merely a
+     * wrong mask_stress result, but a permanently desynced UART stream
+     * that hung every later scenario call too. Confirmed with
+     * sequences over 64 bytes: 100% reproducible stream desync. Same
+     * underlying lesson as the race fixed elsewhere in this function --
+     * a buffer that's smaller than what the protocol actually allows
+     * is just a quieter version of the same "don't let a declared
+     * capacity and an enforced one drift apart" mistake. */
+    char steps[255];
     uint8_t n = k;
-    if (n > sizeof(steps)) { n = (uint8_t)sizeof(steps); }
     for (uint8_t i = 0; i < n; i++) { steps[i] = uart_getc(); }
 
     g_rx_count = 0; g_tick_count = 0;
