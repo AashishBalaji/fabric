@@ -3,12 +3,24 @@ have been hit at least once, and a closure percentage against the full
 universe of buckets this project defines. This is the actual "did we
 test enough of the state space" signal -- pass/fail on individual runs
 answers a different question (did this one stimulus behave correctly).
+
+CoverageModel persists to a JSON file (load/save) so closure is a real
+campaign metric, not a per-invocation snapshot. An earlier version only
+ever held hits in memory, reset fresh on every CLI call -- "88% closure"
+was only ever true within one process's lifetime; running the exact
+same command twice produced two unrelated 88%s with no notion of a
+regression campaign accumulating coverage over time, which is the whole
+point of a coverage model in real verification work.
 """
 from __future__ import annotations
 
+import json
 from collections import Counter
+from pathlib import Path
 
 from . import protocol as proto
+
+DEFAULT_COVERAGE_DB = Path.home() / ".fabric_coverage.json"
 
 
 def _bucket(n: int, edges: tuple[int, ...]) -> str:
@@ -20,29 +32,35 @@ def _bucket(n: int, edges: tuple[int, ...]) -> str:
     return labels[len(edges)] if len(edges) < len(labels) else "huge"
 
 
+# Bucket edges and the universes below must stay consistent with
+# random_gen.py's generator ranges -- they previously weren't:
+# gen_directed_n/gen_gpio_n draw n in 1..12, but these universes only
+# listed tiny/small/medium (n<=8), so any generated n in 9..12 bucketed
+# to "large" and was silently invisible to closure()/gaps() -- not a
+# gap, not a hit, just dropped. ~32% of generated stimulus was affected.
 def directed_bucket(n: int) -> str:
     return f"directed/n={_bucket(n, (1, 3, 8))}"
 
 
-DIRECTED_UNIVERSE = {f"directed/n={b}" for b in ("tiny", "small", "medium")}
+DIRECTED_UNIVERSE = {f"directed/n={b}" for b in ("tiny", "small", "medium", "large")}
 
 
 def gpio_bucket(n: int) -> str:
     return f"gpio/n={_bucket(n, (1, 3, 8))}"
 
 
-GPIO_UNIVERSE = {f"gpio/n={b}" for b in ("tiny", "small", "medium")}
+GPIO_UNIVERSE = {f"gpio/n={b}" for b in ("tiny", "small", "medium", "large")}
 
 
 def nested_bucket(result: proto.NestedResult) -> str:
     if not result.uart_handler_ran:
-        return "nested/uart_handler_did_not_run"
+        return "nested/uart_handler_did_not_fire"
     k = result.ticks_nested_inside_uart_handler
     return f"nested/ticks_inside={_bucket(k, (0, 1, 2))}"
 
 
 NESTED_UNIVERSE = {
-    "nested/uart_handler_did_not_run",
+    "nested/uart_handler_did_not_fire",
     "nested/ticks_inside=tiny",  # 0 ticks nested in -- priority NOT honored
     "nested/ticks_inside=small",  # 1 tick nested in
     "nested/ticks_inside=medium",  # 2+ ticks nested in
@@ -91,3 +109,22 @@ class CoverageModel:
         findings, not coverage gaps, and should surface in reports even
         if a bucket like this has plenty of hits."""
         return sorted(b for b in self.hits if b.endswith("/MISMATCH") and self.hits[b] > 0)
+
+    @classmethod
+    def load(cls, path: Path = DEFAULT_COVERAGE_DB) -> "CoverageModel":
+        """Load accumulated hits from a prior campaign, if any. Missing
+        or unreadable files just start a fresh (empty) model -- this is
+        a convenience cache, not a source of truth worth failing over."""
+        model = cls()
+        try:
+            data = json.loads(path.read_text())
+            model.hits.update(data)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+        return model
+
+    def save(self, path: Path = DEFAULT_COVERAGE_DB) -> None:
+        try:
+            path.write_text(json.dumps(dict(self.hits), indent=2, sort_keys=True))
+        except OSError:
+            pass  # best-effort; a failed save shouldn't fail the run

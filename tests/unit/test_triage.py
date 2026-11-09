@@ -44,12 +44,12 @@ def test_check_nested_priority_not_honored():
 
 
 def test_check_mask_stress_pass():
-    r = proto.parse_mask_stress("M 0 5")
+    r = proto.parse_mask_stress("M 0 5 0")
     assert tri.check_mask_stress("D", r) is None
 
 
 def test_check_mask_stress_mismatch():
-    r = proto.parse_mask_stress("M 1 5")
+    r = proto.parse_mask_stress("M 1 5 0")
     f = tri.check_mask_stress("D", r)
     assert f.signature == "mask_state_mismatch"
 
