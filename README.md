@@ -19,15 +19,16 @@ Fabric run report
 Total scenario runs: 60
 Findings: 6
 
-Coverage closure: 83%
-Uncovered buckets (3):
+Coverage closure: 78%
+Uncovered buckets (4):
   - gpio/n=small
   - mask_stress/len=tiny/final=enabled/matches_prediction
+  - nested/ticks_inside=medium
   - nested/uart_handler_did_not_fire
 
 Failure clusters (by signature):
   [6x] priority_not_honored
-      e.g. log=(3, 4, 3, 4, 3, 4, 3, 4, 1)
+      e.g. log=(1, 2)
       root cause: The UART handler ran, but no SysTick interrupt fired during it...
 ```
 This is a real, unedited run (not cherry-picked) -- see "One finding is left
@@ -35,8 +36,12 @@ in, on purpose" below for why `priority_not_honored` fires on a real minority
 of `nested_priority` runs rather than being suppressed or treated as flaky.
 Run it yourself and the exact numbers will differ (findings count, which
 buckets are uncovered) -- that's expected under real QEMU timing, not a sign
-something's broken; what should stay true is `nested_priority` completing
-(not crashing/stalling) on the large majority of runs.
+something's broken. What should stay true, and was measured rather than
+assumed: across 30 consecutive `--nested` runs plus 42 `--mask-stress` runs
+on sequences that specifically end with the RX interrupt armed (the case
+most likely to expose a race), 0 timed out and the UART handler ran every
+time -- see "A second, more severe race was still here" below for what
+changed to get there.
 
 ## What's real
 
@@ -97,6 +102,34 @@ something's broken; what should stay true is `nested_priority` completing
     `tick_wait_timeouts` as a 4th wire field, so the host can tell "a
     tick arrived" apart from "we gave up waiting" instead of silently
     treating them the same.
+- **A second, more severe race was still here after the exit-condition
+  fix above: `nested_priority` and `mask_stress`'s trailing probe were
+  polling `uart_getc()` in the foreground for the exact same byte the
+  just-armed RX interrupt was also listening for.** This is the same
+  command/interrupt race class already fixed for `mask_stress`'s step
+  sequence (above), reintroduced in two other places. The ISR almost
+  always won the race, drained the byte, and left the foreground's
+  `uart_getc()` poll spinning on an already-empty holding register
+  forever, bounded only by the host's process-level timeout -- a real,
+  reproducible hang, not a cosmetic issue: a second independent review
+  measured this hanging 3 of 4 runs of this project's own integration
+  test suite before the fix. Fixed by not polling for that byte at all
+  when the interrupt is armed for it -- `nested_priority` already waits
+  on `g_uart_exit_seen`, and `mask_stress` now tracks whether its last
+  step left the mask enabled and waits on the ISR-driven `g_rx_count`
+  instead of `uart_getc()` in that case. A related issue surfaced at
+  the same time: the 8-entry event log for `nested_priority` was
+  usually saturated by ordinary pre-UART SysTick tick pairs (SysTick
+  starts well before the host's trigger byte physically arrives over
+  the pipe), truncating away the UART-exit marker the nested-tick count
+  depends on -- measured at well under 1-in-30 runs ever reporting a
+  nonzero nested-tick count, even on runs where the handler ran
+  successfully. Fixed by only logging SysTick events while the UART
+  handler's busy-loop is actually executing, so the log's 8 slots are
+  spent on the window that matters instead of irrelevant background
+  ticks. Both fixes were verified empirically (30 `--nested` runs, 42
+  `--mask-stress` runs on interrupt-armed-ending sequences), not just
+  reasoned about -- see the run output above.
 - **An earlier design for self-generated stimulus (UART loopback mode)
   was abandoned, not fixed.** Looping TX back to RX internally seemed
   like a clean way to avoid host/firmware timing races, but introduced
@@ -125,6 +158,12 @@ something's broken; what should stay true is `nested_priority` completing
   twice doesn't produce two unrelated percentages with no memory of
   each other. Pass `--fresh-coverage` to opt out and report closure for
   that invocation alone (used for this README's reproducible examples).
+  Known limitation, disclosed rather than silently assumed away: `load()`/
+  `save()` is a plain read-then-overwrite with no locking, so two `fabric
+  run` invocations active at the same time can race and one's save can
+  clobber the other's -- fine for the single-operator, run-one-at-a-time
+  use this is built for, not safe for concurrent campaigns without adding
+  real file locking first.
 - **The random generator is actually constrained, not just uniform.**
   `--random` biases toward boundary values (`n` at its min/max,
   min/max-length mask sequences) and forces known bug-triggering corner
