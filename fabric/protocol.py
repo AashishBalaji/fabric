@@ -145,6 +145,13 @@ def mask_stress_probe_byte() -> bytes:
 class MaskStressResult:
     rx_count: int
     tick_count: int
+    tick_wait_timeouts: int = 0
+    """How many of this run's 'T' steps gave up waiting for a tick
+    instead of actually observing one. An earlier firmware version
+    didn't report this at all, treating "gave up" and "a tick arrived"
+    identically -- a silent wrong-but-plausible result. Nonzero here
+    means the run's tick_count (and any 'T'-gated timing) is less
+    trustworthy than it looks."""
 
     @property
     def probe_was_counted(self) -> bool:
@@ -153,9 +160,11 @@ class MaskStressResult:
 
 def parse_mask_stress(line: str) -> MaskStressResult:
     parts = line.split()
-    if len(parts) != 3 or parts[0] != "M":
+    if len(parts) != 4 or parts[0] != "M":
         raise ProtocolError(f"bad mask_stress response: {line!r}")
-    return MaskStressResult(rx_count=int(parts[1]), tick_count=int(parts[2]))
+    return MaskStressResult(
+        rx_count=int(parts[1]), tick_count=int(parts[2]), tick_wait_timeouts=int(parts[3])
+    )
 
 
 def final_mask_state(steps: str) -> bool:

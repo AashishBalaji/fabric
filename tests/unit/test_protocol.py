@@ -75,13 +75,27 @@ def test_final_mask_state(steps, expected_enabled):
 
 
 def test_parse_mask_stress_probe_counted():
-    r = proto.parse_mask_stress("M 1 9")
+    r = proto.parse_mask_stress("M 1 9 0")
     assert r.probe_was_counted is True
 
 
 def test_parse_mask_stress_probe_not_counted():
-    r = proto.parse_mask_stress("M 0 9")
+    r = proto.parse_mask_stress("M 0 9 0")
     assert r.probe_was_counted is False
+
+
+def test_parse_mask_stress_reports_tick_wait_timeouts():
+    # An earlier firmware version silently treated "gave up waiting
+    # for a tick" the same as "a tick arrived" -- a plain 3-field
+    # response had no way to tell the two apart. The 4th field makes
+    # that distinguishable.
+    r = proto.parse_mask_stress("M 1 2 3")
+    assert r.tick_wait_timeouts == 3
+
+
+def test_parse_mask_stress_rejects_old_three_field_format():
+    with pytest.raises(proto.ProtocolError):
+        proto.parse_mask_stress("M 1 9")
 
 
 def test_encode_mask_stress_rejects_invalid_step():

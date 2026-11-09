@@ -29,7 +29,13 @@
  * delivered regardless of what a scenario does to the RX interrupt mask. */
 static void uart_init(void) {
     UART0_CTL = 0;
-    UART0_IBRD = 2; UART0_FBRD = 45; /* ~115200 @ 6MHz UARTCLK, close enough for QEMU's model */
+    /* BRD = UARTCLK / (16 * baud) = 6,000,000 / (16 * 115200) = 3.2552,
+     * so IBRD=3, FBRD=round(0.2552*64)=16. An earlier IBRD=2/FBRD=45
+     * was off by ~20% (BRD=2.7031 -> ~138.7kbaud) -- undetectable by
+     * this harness since QEMU's UART model doesn't emulate bit-level
+     * timing at all, which is itself a real limitation of this
+     * methodology worth disclosing rather than leaving silently wrong. */
+    UART0_IBRD = 3; UART0_FBRD = 16; /* 115200 @ 6MHz UARTCLK */
     UART0_LCRH = (3 << 5); /* 8N1, no FIFO */
     UART0_CTL = UART_CTL_UARTEN | UART_CTL_TXE | UART_CTL_RXE;
 }
@@ -63,8 +69,11 @@ static volatile uint8_t g_nested_mode = 0;
 static volatile uint8_t g_log[8];
 static volatile uint32_t g_log_len = 0;
 
+static volatile uint8_t g_uart_exit_seen = 0;
+
 static void log_event(uint8_t code) {
     if (g_log_len < 8) { g_log[g_log_len++] = code; }
+    if (code == 2) { g_uart_exit_seen = 1; } /* 2 = UART exit, see comment above */
 }
 
 void SysTick_Handler(void) {
@@ -111,13 +120,25 @@ void UART0_Handler(void) {
     }
 }
 
+/* DSB/ISB after NVIC_ISER0/ICER0: an enable/disable write to NVIC isn't
+ * guaranteed to be visible to the core's interrupt logic immediately on
+ * a Cortex-M (it's a memory-mapped write, not an instruction) -- the
+ * ARMv7-M architecture reference explicitly calls out needing a barrier
+ * if subsequent code depends on the new state taking effect. QEMU's TCG
+ * mode happens not to expose the gap this is standard hygiene against,
+ * which is exactly why it's easy to leave out and still pass every test
+ * here; real silicon is not guaranteed to be that forgiving. */
 static void uart_irq_enable(void) {
     UART0_IM |= UART_IM_RXIM;
     NVIC_ISER0 = (1u << UART0_IRQ);
+    __asm__ volatile ("dsb");
+    __asm__ volatile ("isb");
 }
 
 static void uart_irq_disable(void) {
     NVIC_ICER0 = (1u << UART0_IRQ);
+    __asm__ volatile ("dsb");
+    __asm__ volatile ("isb");
     UART0_IM &= ~UART_IM_RXIM;
 }
 
@@ -180,6 +201,7 @@ static void scenario_gpio(void) {
  * scenario. */
 static void scenario_nested(void) {
     g_log_len = 0;
+    g_uart_exit_seen = 0;
     g_tick_count = 0;
     SCB_SHPR3 = (SCB_SHPR3 & 0x00FFFFFFu) | (0x00u << 24); /* SysTick byte = 0x00 (high prio) */
     NVIC_IPR1 = (NVIC_IPR1 & 0xFFFF00FFu) | (0xE0u << 8);  /* UART0 byte = 0xE0 (low prio) */
@@ -189,7 +211,20 @@ static void scenario_nested(void) {
     uart_putc('R');
     uint8_t marker = (uint8_t)uart_getc(); /* the host's single trigger byte */
     (void)marker;
-    while (g_log_len < 4) { }
+    /* Wait specifically for the UART handler to actually RUN AND EXIT
+     * (log code 2), not just for 4 log entries of any kind. The
+     * previous `while (g_log_len < 4)` was a real bug: SysTick alone
+     * (higher priority, firing every 1500 cycles) can produce 4 log
+     * entries -- two full tick enter/exit pairs -- before the UART
+     * interrupt ever fires at all, satisfying the old exit condition
+     * and making the scenario misreport "no nesting" or even "handler
+     * never fired", independent of whether the thing being tested
+     * (priority preemption) actually happened. Confirmed: this made
+     * the scenario fail on the majority of runs, not occasionally.
+     * Bounded by a generous spin budget so a genuine "UART interrupt
+     * never fired" case still terminates and is reported honestly. */
+    uint32_t spin_budget = 20000000;
+    while (!g_uart_exit_seen && spin_budget--) { }
     uart_irq_disable();
     systick_stop();
     g_nested_mode = 0;
@@ -233,6 +268,7 @@ static void scenario_mask_stress(void) {
     for (uint8_t i = 0; i < n; i++) { steps[i] = uart_getc(); }
 
     g_rx_count = 0; g_tick_count = 0;
+    uint32_t tick_wait_timeouts = 0;
     systick_start(6000);
     for (uint8_t i = 0; i < n; i++) {
         switch (steps[i]) {
@@ -241,6 +277,14 @@ static void scenario_mask_stress(void) {
             case 'T': { uint32_t before = g_tick_count;
                         uint32_t budget = 2000000;
                         while (g_tick_count == before && budget--) { }
+                        /* An earlier version let this fall through
+                         * silently on exhaustion, treating "gave up
+                         * waiting" identically to "a tick actually
+                         * arrived" -- exactly the kind of silent
+                         * wrong-but-plausible result this project's
+                         * own README warns against. Now it's counted
+                         * and reported. */
+                        if (g_tick_count == before) { tick_wait_timeouts++; }
                         break; }
             default: break; /* unrecognized command bytes are a no-op on purpose */
         }
@@ -260,7 +304,8 @@ static void scenario_mask_stress(void) {
     uart_irq_disable();
     systick_stop();
     uart_puts("M "); uart_put_u32(g_rx_count); uart_putc(' ');
-    uart_put_u32(g_tick_count); uart_putc('\n');
+    uart_put_u32(g_tick_count); uart_putc(' ');
+    uart_put_u32(tick_wait_timeouts); uart_putc('\n');
 }
 
 int main(void) {
