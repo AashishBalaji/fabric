@@ -87,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     execute_plan(soc, scenario, scenario_args, coverage, triage)
                     completed += 1
-                except (SocTimeoutError, proto.ProtocolError) as e:
+                except (SocTimeoutError, proto.ProtocolError, BrokenPipeError) as e:
                     # An earlier version let this propagate as an
                     # unhandled traceback, discarding every result
                     # already gathered in the batch -- see
@@ -95,7 +95,14 @@ def main(argv: list[str] | None = None) -> int:
                     # finding and stop: a timeout mid-scenario can
                     # leave the UART byte stream desynced, so running
                     # further scenarios on the same boot risks results
-                    # that look legitimate but aren't.
+                    # that look legitimate but aren't. BrokenPipeError
+                    # is included alongside the two protocol-level
+                    # errors because it's the same class of problem one
+                    # level down: the QEMU child died (killed, crashed,
+                    # or never finished booting) before a write even
+                    # reached it, which is an infra failure, not a
+                    # result to lose silently or crash the whole batch
+                    # over.
                     triage.record(tri.Finding(
                         scenario=scenario, args={"args": scenario_args},
                         signature="infra_error", detail=str(e), observed=None,

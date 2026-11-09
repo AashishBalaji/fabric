@@ -43,7 +43,12 @@ CATALOG: dict[str, str] = {
         "it, even though SysTick's priority number was programmed "
         "lower (= higher priority) than UART0's. Check SCB_SHPR3 / "
         "NVIC_IPR1 programming and confirm the handler is actually busy "
-        "long enough for a tick to land inside its window."
+        "long enough for a tick to land inside its window. In practice "
+        "(see README) this usually reflects genuine tick/handler timing "
+        "alignment on that particular run, not a priority-programming "
+        "bug -- a nonzero count scattered across a batch is expected; "
+        "what would actually indicate a regression is this firing on "
+        "every run, not an occasional one."
     ),
     "uart_handler_did_not_fire": (
         "No UART RX interrupt was observed at all for this run. Check "
