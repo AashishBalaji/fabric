@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+firmware/*.o
+firmware/firmware.elf
+firmware/firmware.bin
+.pytest_cache/

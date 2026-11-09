@@ -1,0 +1,13 @@
+[project]
+name = "fabric"
+version = "0.1.0"
+description = "A QEMU-hosted SoC functional validation framework: directed and constrained-random tests, coverage tracking, and failure triage against real Cortex-M3 firmware."
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+markers = [
+    "qemu: tests that actually boot QEMU and talk to the real firmware (slower, real I/O)",
+]
