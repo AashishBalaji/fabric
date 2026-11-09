@@ -70,6 +70,20 @@ static volatile uint8_t g_log[8];
 static volatile uint32_t g_log_len = 0;
 
 static volatile uint8_t g_uart_exit_seen = 0;
+/* True only while the UART handler's long busy-loop is actually running
+ * -- gates whether SysTick logs itself below. Without this, SysTick
+ * fires every 1500 cycles starting the moment systick_start() runs,
+ * well before the host's trigger byte has even arrived over the
+ * pipe (real round-trip latency, not firmware-controlled) -- so the
+ * 8-entry g_log filled up with ordinary pre-UART tick pairs almost
+ * every run, truncating away the UART_EXIT marker that
+ * ticks_nested_inside_uart_handler actually depends on. Measured:
+ * fewer than 1 in 30 runs ever reported a nonzero nested-tick count
+ * as a result, even on runs where the UART handler ran successfully --
+ * the scenario was rarely demonstrating the thing it exists to
+ * measure. Only logging ticks that land during the UART handler's
+ * actual window fixes that without touching the log's size. */
+static volatile uint8_t g_uart_active = 0;
 
 static void log_event(uint8_t code) {
     if (g_log_len < 8) { g_log[g_log_len++] = code; }
@@ -78,7 +92,7 @@ static void log_event(uint8_t code) {
 
 void SysTick_Handler(void) {
     g_tick_count++;
-    if (g_nested_mode) {
+    if (g_nested_mode && g_uart_active) {
         log_event(3);
         /* A deliberately short busy-loop so this handler has nonzero
          * duration to preempt INTO -- long enough to be observable,
@@ -110,11 +124,13 @@ void UART0_Handler(void) {
         g_rx_count++;
         if (g_nested_mode) {
             log_event(1);
+            g_uart_active = 1;
             /* A long busy-loop standing in for "a slow handler" -- long
              * enough that, if SysTick's higher priority is actually
              * honored, a tick lands and fully preempts somewhere in
              * here rather than queuing behind this handler's return. */
             for (volatile uint32_t i = 0; i < 20000; i++) { }
+            g_uart_active = 0;
             log_event(2);
         }
     }
@@ -202,6 +218,7 @@ static void scenario_gpio(void) {
 static void scenario_nested(void) {
     g_log_len = 0;
     g_uart_exit_seen = 0;
+    g_uart_active = 0;
     g_tick_count = 0;
     SCB_SHPR3 = (SCB_SHPR3 & 0x00FFFFFFu) | (0x00u << 24); /* SysTick byte = 0x00 (high prio) */
     NVIC_IPR1 = (NVIC_IPR1 & 0xFFFF00FFu) | (0xE0u << 8);  /* UART0 byte = 0xE0 (low prio) */
@@ -209,8 +226,18 @@ static void scenario_nested(void) {
     systick_start(1500); /* short reload: a tick should land mid-way through the long UART handler loop above */
     uart_irq_enable();
     uart_putc('R');
-    uint8_t marker = (uint8_t)uart_getc(); /* the host's single trigger byte */
-    (void)marker;
+    /* Do NOT poll uart_getc() here for the host's trigger byte: the RX
+     * interrupt is already armed above, listening for this exact same
+     * byte. An earlier version did `uart_getc()` right here, which
+     * raced the newly-armed ISR for who drains UART0_DR -- the ISR
+     * almost always won (it preempts the tight polling loop as soon as
+     * the byte arrives), leaving uart_getc()'s RXFE-poll spinning
+     * forever on a register the ISR had already emptied. Confirmed:
+     * this hung the scenario outright on a large fraction of runs, not
+     * merely misreported it -- the same command/interrupt race class
+     * already fixed in mask_stress below, reintroduced here. The byte
+     * is simply left for the ISR; g_uart_exit_seen below already
+     * encodes "the byte arrived and the handler ran to completion." */
     /* Wait specifically for the UART handler to actually RUN AND EXIT
      * (log code 2), not just for 4 log entries of any kind. The
      * previous `while (g_log_len < 4)` was a real bug: SysTick alone
@@ -269,11 +296,17 @@ static void scenario_mask_stress(void) {
 
     g_rx_count = 0; g_tick_count = 0;
     uint32_t tick_wait_timeouts = 0;
+    uint8_t irq_armed = 0; /* mirrors the mask state the sequence leaves
+                             * behind -- tracked here (not re-derived from
+                             * UART0_IM) so the trailing probe below knows,
+                             * without touching a register, whether the ISR
+                             * is listening for the same byte it's about to
+                             * wait for. */
     systick_start(6000);
     for (uint8_t i = 0; i < n; i++) {
         switch (steps[i]) {
-            case 'E': uart_irq_enable(); break;
-            case 'D': uart_irq_disable(); break;
+            case 'E': uart_irq_enable(); irq_armed = 1; break;
+            case 'D': uart_irq_disable(); irq_armed = 0; break;
             case 'T': { uint32_t before = g_tick_count;
                         uint32_t budget = 2000000;
                         while (g_tick_count == before && budget--) { }
@@ -289,9 +322,27 @@ static void scenario_mask_stress(void) {
             default: break; /* unrecognized command bytes are a no-op on purpose */
         }
     }
+    uint32_t rx_before_probe = g_rx_count;
     uart_putc('R');
-    uint8_t probe = (uint8_t)uart_getc(); /* the host's single trailing probe byte */
-    (void)probe;
+    if (irq_armed) {
+        /* The RX interrupt is armed for this exact probe byte -- do not
+         * poll uart_getc() here. An earlier version did, and that polling
+         * read raced the armed ISR for who drains UART0_DR: the ISR
+         * (correctly) almost always won, leaving uart_getc()'s RXFE-poll
+         * spinning forever on an already-emptied register. Confirmed:
+         * any sequence left enabled (e.g. just "E") hung on this line a
+         * large fraction of the time -- exactly the same race class this
+         * scenario's own header comment describes fixing for the step
+         * sequence itself, reintroduced here for the trailing probe.
+         * Wait on the ISR-driven counter instead, bounded so a probe that
+         * genuinely never arrives still terminates and reports honestly. */
+        uint32_t budget = 2000000;
+        while (g_rx_count == rx_before_probe && budget--) { }
+    } else {
+        /* Mask is disabled: no ISR is listening for this byte, so it's
+         * safe to poll for it directly -- there's no race to lose. */
+        (void)uart_getc();
+    }
     /* Give a pending-but-still-masked probe byte a moment to sit in the
      * holding register (matching real hardware: it arrived, it's just
      * not interrupt-driven), then read it ourselves if the ISR hasn't,
