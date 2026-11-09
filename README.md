@@ -31,12 +31,15 @@ Failure clusters (by signature):
       e.g. log=(1, 2)
       root cause: The UART handler ran, but no SysTick interrupt fired during it...
 ```
-This is a real, unedited run (not cherry-picked) -- see "One finding is left
-in, on purpose" below for why `priority_not_honored` fires on a real minority
-of `nested_priority` runs rather than being suppressed or treated as flaky.
-Run it yourself and the exact numbers will differ (findings count, which
-buckets are uncovered) -- that's expected under real QEMU timing, not a sign
-something's broken. What should stay true, and was measured rather than
+This is a real, unedited run (not cherry-picked), but it's illustrative, not
+reproducible verbatim: `--seed 7` makes the *stimulus* deterministic, not the
+real QEMU timing each run interacts with, so a re-run with the exact same
+command gets a different closure percentage and finding count (seeds 1-3
+measured at closures of 83%/94%/78% and 10/7/3 findings, for reference) --
+see "One finding is left in, on purpose" below for why `priority_not_honored`
+fires on a real minority of `nested_priority` runs rather than being
+suppressed or treated as flaky. That run-to-run variance is expected under
+real QEMU timing, not a sign something's broken. What should stay true, and was measured rather than
 assumed: across 30 consecutive `--nested` runs plus 42 `--mask-stress` runs
 on sequences that specifically end with the RX interrupt armed (the case
 most likely to expose a race), 0 timed out and the UART handler ran every
@@ -130,6 +133,24 @@ changed to get there.
   ticks. Both fixes were verified empirically (30 `--nested` runs, 42
   `--mask-stress` runs on interrupt-armed-ending sequences), not just
   reasoned about -- see the run output above.
+- **A third review round, specifically re-testing the race fix above
+  under adversarial load, found a related latent bug it hadn't yet
+  triggered:** `scenario_mask_stress`'s step-sequence buffer was sized
+  at 64 bytes while the wire protocol (`encode_mask_stress`) permits
+  sequences up to 255 -- a sequence over 64 steps got silently
+  truncated firmware-side while the host still wrote the full sequence
+  onto the wire, leaving the untruncated tail sitting unread in the
+  pipe. Whatever ran next on the same boot then misread those leftover
+  bytes as its own stimulus -- not just a wrong `mask_stress` result,
+  but a 100%-reproducible UART stream desync that hung every later
+  scenario on that boot. The project's own `--random` generator never
+  exercised this (it caps sequences at 8 steps), so it had stayed
+  latent through two prior review rounds. Fixed by sizing the buffer
+  to the protocol's actual declared limit (255) instead of an
+  arbitrary smaller number -- the same lesson as the race fixed above,
+  one level down: a capacity enforced in code that's smaller than the
+  capacity promised by the protocol is a quieter version of the same
+  mistake.
 - **An earlier design for self-generated stimulus (UART loopback mode)
   was abandoned, not fixed.** Looping TX back to RX internally seemed
   like a clean way to avoid host/firmware timing races, but introduced
@@ -211,7 +232,7 @@ firmware/   bare-metal C: regs.h, startup.c, main.c, stellaris.ld, Makefile
 fabric/     host package: protocol.py, soc.py, coverage.py,
             random_gen.py, triage.py, report.py, cli.py
 tests/
-  unit/        fast, pure-Python, no QEMU (49 tests)
+  unit/        fast, pure-Python, no QEMU (55 tests)
   integration/ real QEMU boots, marked `qemu` (10 tests)
 ```
 
@@ -240,7 +261,7 @@ python3 -m fabric.cli run --random 60 --seed 7 --fresh-coverage   # one-off, no 
 
 ```bash
 pip install pytest --break-system-packages
-python3 -m pytest tests/unit -q           # fast, no QEMU, 49 tests
+python3 -m pytest tests/unit -q           # fast, no QEMU, 55 tests
 python3 -m pytest tests/integration -q -m qemu   # real QEMU boots, 10 tests
-python3 -m pytest tests -q                # both, 59 tests
+python3 -m pytest tests -q                # both, 65 tests
 ```
