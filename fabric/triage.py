@@ -51,6 +51,18 @@ CATALOG: dict[str, str] = {
         "before the stimulus byte was sent, and that the byte actually "
         "reached the RX line."
     ),
+    "infra_error": (
+        "The run itself failed (a QEMU/protocol timeout or a malformed "
+        "response), separate from any oracle mismatch. An earlier CLI "
+        "version let this propagate as an unhandled traceback, silently "
+        "discarding every result already gathered in the batch -- "
+        "exactly the kind of lost information this project's own "
+        "triage system exists to avoid. It's recorded as a finding "
+        "(not swallowed) and the batch stops here, since a timeout "
+        "mid-scenario can leave the UART byte stream desynced -- "
+        "continuing to run further scenarios on the same boot risks "
+        "garbage-in-garbage-out results that look legitimate but aren't."
+    ),
     "mask_state_mismatch": (
         "A stimulus byte's fate (counted vs. not) didn't match what the "
         "final E/D state of the step sequence predicted. Either the "

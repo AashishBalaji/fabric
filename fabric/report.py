@@ -26,6 +26,12 @@ def render(coverage: CoverageModel, triage: TriageEngine, total_runs: int) -> st
             lines.append(f"  - {g}")
     else:
         lines.append("No coverage gaps against the defined universe.")
+
+    mismatches = coverage.mismatches()
+    if mismatches:
+        lines.append(f"Oracle/actual mismatches ({len(mismatches)}):")
+        for m in mismatches:
+            lines.append(f"  - {m}")
     lines.append("")
 
     clusters = triage.clusters()

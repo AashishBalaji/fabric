@@ -12,10 +12,11 @@ import argparse
 import sys
 
 from . import coverage as cov
+from . import protocol as proto
 from . import random_gen as rg
 from . import report as rpt
 from . import triage as tri
-from .soc import Soc
+from .soc import Soc, SocTimeoutError
 
 
 def execute_plan(soc: Soc, scenario: str, args: tuple, coverage: cov.CoverageModel, triage: tri.TriageEngine) -> None:
@@ -53,6 +54,11 @@ def main(argv: list[str] | None = None) -> int:
     run_p.add_argument("--mask-stress", type=str, metavar="STEPS", help="run mask_stress with an explicit E/D/T step string")
     run_p.add_argument("--random", type=int, metavar="COUNT", help="run COUNT randomly generated scenarios")
     run_p.add_argument("--seed", type=int, default=0, help="seed for --random (default 0)")
+    run_p.add_argument(
+        "--fresh-coverage", action="store_true",
+        help="don't load/save the persistent coverage campaign (~/.fabric_coverage.json); "
+             "report closure for this invocation only",
+    )
 
     args = parser.parse_args(argv)
 
@@ -73,13 +79,38 @@ def main(argv: list[str] | None = None) -> int:
             print("Nothing to run -- pass at least one of --directed/--gpio/--nested/--mask-stress/--random", file=sys.stderr)
             return 2
 
-        coverage = cov.CoverageModel()
+        coverage = cov.CoverageModel() if args.fresh_coverage else cov.CoverageModel.load()
         triage = tri.TriageEngine()
+        completed = 0
         with Soc() as soc:
             for scenario, scenario_args in plans:
-                execute_plan(soc, scenario, scenario_args, coverage, triage)
+                try:
+                    execute_plan(soc, scenario, scenario_args, coverage, triage)
+                    completed += 1
+                except (SocTimeoutError, proto.ProtocolError) as e:
+                    # An earlier version let this propagate as an
+                    # unhandled traceback, discarding every result
+                    # already gathered in the batch -- see
+                    # triage.CATALOG["infra_error"]. Record it as a
+                    # finding and stop: a timeout mid-scenario can
+                    # leave the UART byte stream desynced, so running
+                    # further scenarios on the same boot risks results
+                    # that look legitimate but aren't.
+                    triage.record(tri.Finding(
+                        scenario=scenario, args={"args": scenario_args},
+                        signature="infra_error", detail=str(e), observed=None,
+                    ))
+                    print(
+                        f"Stopping early: {scenario} failed ({e}); "
+                        f"{len(plans) - completed - 1} remaining plan(s) skipped.",
+                        file=sys.stderr,
+                    )
+                    break
 
-        print(rpt.render(coverage, triage, total_runs=len(plans)))
+        if not args.fresh_coverage:
+            coverage.save()
+
+        print(rpt.render(coverage, triage, total_runs=completed))
         return 1 if triage.findings else 0
 
     return 2
