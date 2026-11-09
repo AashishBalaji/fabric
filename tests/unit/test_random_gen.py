@@ -32,14 +32,27 @@ def test_gen_directed_n_is_biased_toward_boundaries_not_uniform():
 
 
 def test_gen_mask_sequence_forces_known_bug_triggering_adjacency():
-    # The "ED"/"DE" adjacency is what the command/interrupt race (see
-    # README) actually corrupted -- a uniform sampler would produce it
-    # only incidentally. This pins that it's deliberately forced often
-    # enough to matter, not left to chance.
+    # An earlier version of this test checked "ED"/"DE" adjacency
+    # against a threshold of 0.2 -- but with only 3 symbols (E/D/T) and
+    # lengths 2-8, a PLAIN UNIFORM sampler produces that adjacency
+    # incidentally about 56% of the time on its own (measured), so that
+    # threshold passed for both the real generator and a reverted,
+    # uniform one -- it had no teeth. A repeated-step run ("EEEE",
+    # "DDDD", ...) is a much cleaner signal: the real generator forces
+    # it deliberately (~20%, measured), while a uniform sampler over
+    # length>=2 produces it only by chance (~7%, measured) -- an
+    # 8-point-plus gap wide enough for a real regression back to
+    # uniform sampling to actually fail this.
     r = random.Random(0)
-    seqs = [rg.gen_mask_sequence(r, min_len=2, max_len=8) for _ in range(500)]
+    seqs = [rg.gen_mask_sequence(r, min_len=2, max_len=8) for _ in range(5000)]
+    all_same_step = sum(1 for s in seqs if len(set(s)) == 1)
+    assert all_same_step / len(seqs) > 0.15
+
+    # Also keep an adjacency check, just with a threshold that reflects
+    # the real combined rate (forced + incidental, ~63% measured) rather
+    # than one indistinguishable from the ~56% uniform baseline.
     has_adjacency = sum(1 for s in seqs if "ED" in s or "DE" in s)
-    assert has_adjacency / len(seqs) > 0.2
+    assert has_adjacency / len(seqs) > 0.6
 
 
 def test_gen_plans_is_reproducible_for_same_seed():
